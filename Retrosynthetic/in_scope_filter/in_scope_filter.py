@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+# @Time    : 18-8-23 下午3:29
+# @Author  : HeJi
+# @FileName: module.py
+# @E-mail: hj@jimhe.cn
+
+
 import numpy as np
 from keras.models import load_model
 from keras.models import Model

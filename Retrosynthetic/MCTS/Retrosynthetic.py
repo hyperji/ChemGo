@@ -10,52 +10,15 @@ from .mcts_node import State
 from absl import app, flags
 import time
 import numpy as np
-
-FLAGS = flags.FLAGS
-
-
-def Retrosynthetic_v1(expand_network, rollout_network, in_scope_filter, state,lbl1, lbl2, exp_indexes, rot_indexes, build_block_mols, verbosity=0):
-    """
-    TODO Merge with Reinforcement Learning
-    With mcts of AlphaGo 2016, also used in paper
-    Planning chemical syntheses with deep neural networks and symbolic AI
-
-    Want better performance than the paper above? (No Guarantee)
-    -- Try Retrosynthetic_v2
-
-    :param expand_network:
-    :param rollout_network:
-    :param state:
-    :param verbosity:
-    :return:
-    """
-
-    Searcher = MCTS_Policy_old(expand_network,rollout_network, in_scope_filter, lbl1=lbl1, lbl2=lbl2,
-                               exp_indexes=exp_indexes, rot_indexes=rot_indexes,verbosity=verbosity)
-    Searcher.initialize(state)
-    # Must run this once at the start to expand the root node.
-    first_node = Searcher.root.select_leaf()
-    unsolved_mols, unsolved_indexes = first_node.state.get_unsolved_mols_and_indexes(build_block_mols=build_block_mols)
-    probs = expand_network.run(first_node.state, unsolved_indexes = unsolved_indexes, feat_indexes=exp_indexes)
-    probs = np.sum(probs,axis=0)
-    first_node.incorporate_results(probs, build_block_mols)
-    readouts = FLAGS.num_readouts
-    while True:
-        current_readouts = Searcher.root.N
-        # we want to do "X additional readouts", rather than "up to X readouts".
-        while Searcher.root.N < current_readouts + readouts:
-            Searcher.mcts_policy()
-        transformation = Searcher.pick_transformation()
-        transformation = Searcher.decoding(transformation)
-        Searcher.exec_transform(transformation)
-        if Searcher.root.is_done():
-            Searcher.set_result(Searcher.root.state.is_solved())
-            break
-    return Searcher
+from hyperparams import Hyperparams as hp
 
 
 
-def Retrosynthetic_v2(network, state, verbosity=0):
+
+
+def Retrosynthetic(network, in_scope_filter, state, lbl1, lbl2,
+                   exp_indexes, build_block_mols, parallel_readouts=None,
+                   num_readouts = None, verbosity=0):
     """
     TODO Merge with Reinforcement Learning
     With mcts of AlphaGo Zero 2017, newest version of AlphaGo
@@ -64,25 +27,41 @@ def Retrosynthetic_v2(network, state, verbosity=0):
     :param verbosity:
     :return:
     """
-    Searcher = MCTS_Policy(network,
-                        verbosity=verbosity)
+
+    Searcher = MCTS_Policy_old(network, in_scope_filter, lbl1, lbl2, exp_indexes, verbosity=verbosity,
+                               softpick_move_cutoff=hp.softpick_move_cutoff)
 
     Searcher.initialize(state)
 
+    Searcher.startup(build_block_mols=build_block_mols)
+
     # Must run this once at the start to expand the root node.
-    first_node = Searcher.root.select_leaf()
-    prob = network.run(first_node.state)
-    first_node.incorporate_results(prob)
-    readouts = FLAGS.num_readouts
+    moves = []
+    associated_mols = []
     while True:
         current_readouts = Searcher.root.N
         # we want to do "X additional readouts", rather than "up to X readouts".
-        while Searcher.root.N < current_readouts + readouts:
-            Searcher.tree_search()
-        transformation = Searcher.pick_transformation()
-        Searcher.exec_transform(transformation)
-        if Searcher.root.is_done():
-            Searcher.set_result(Searcher.root.state.is_solved())
+        if parallel_readouts is None:
+            parallel_readouts = hp.parallel_readouts
+        if num_readouts is None:
+            num_readouts = hp.num_readouts
+
+        while Searcher.root.N < current_readouts + num_readouts:
+            Searcher.tree_search(build_block_mols, parallel_readouts=parallel_readouts)
+        move = Searcher.pick_transformation()
+
+        best_move = Searcher.root.local_global_trans_maps[move]
+        associated_mol = Searcher.root.local_trans_mol_maps[move]
+
+        best_move = Searcher.decoding(best_move)
+        associated_mols.append(associated_mol)
+        moves.append(best_move)
+
+
+        Searcher.exec_transform(c=move)
+        if Searcher.root.is_done(build_block_mols=build_block_mols):
+            solved = Searcher.root.state.is_solved(build_block_mols=build_block_mols)
+            Searcher.set_result(solved)
             break
-    return Searcher
+    return Searcher, moves, associated_mols
 

@@ -32,9 +32,10 @@ import copy
 from rdkit import Chem
 from sklearn.preprocessing import LabelEncoder
 from hyperparams import Hyperparams as hp
+from utils import get_topk_transformation_v2
 
 # 722 moves for 19x19, 162 for 9x9
-flags.DEFINE_integer('max_game_length', int(25),
+flags.DEFINE_integer('max_game_length', int(5),
                      'Move number at which game is forcibly terminated')
 
 flags.DEFINE_float('c_puct', 0.96,
@@ -113,6 +114,7 @@ class State(object):
         the_state.recent += (transformation,)
         target_mol = self.mols[index]
 
+        print("transformation", transformation, "target_mol", target_mol)
         reactants = single_step_synthesis(transformation, target_mol)
 
         #print("reactants", reactants)
@@ -159,7 +161,12 @@ class MCTSNode(object):
     parent: A parent MCTSNode.
     """
 
-    def __init__(self, state,  transformation=None, trans_id = None,  parent=None):
+    def __init__(self,
+                 state,
+                 parent_local_trans_id = None,
+                 local_global_trans_maps = None,
+                 local_trans_mol_maps = None,
+                 parent=None):
         """
 
         :param state:
@@ -169,18 +176,20 @@ class MCTSNode(object):
         if parent is None:
             parent = DummyNode()
         self.parent = parent
-        self.trans_id = trans_id
-        self.transformation = transformation  # transformation that led to this state,
         self.state = state
         self.is_expanded = False
         self.losses_applied = 0  # number of virtual losses on this node
         # using child_() allows vectorized computation of action score.
-        self.child_N = np.zeros([hp.num_transformations], dtype=np.float32)
-        self.child_W = np.zeros([hp.num_transformations], dtype=np.float32)
+        self.child_N = np.zeros([hp.expand_topk], dtype=np.float32)
+        self.child_W = np.zeros([hp.expand_topk], dtype=np.float32)
         # save a copy of the original prior before it gets mutated by d-noise.
-        self.original_prior = np.zeros([hp.num_transformations], dtype=np.float32)
-        self.child_prior = np.zeros([hp.num_transformations], dtype=np.float32)
+        self.original_prior = np.zeros([hp.expand_topk], dtype=np.float32)
+        self.child_prior = np.zeros([hp.expand_topk], dtype=np.float32)
         self.children = {}  # map of transformation to resulting MCTSNode
+        self.local_global_trans_maps = local_global_trans_maps
+        self.local_trans_mol_maps = local_trans_mol_maps
+        self.parent_local_trans_id = parent_local_trans_id
+
 
     def __repr__(self):
         return "<MCTSNode move=%s, N=%s" % (
@@ -209,21 +218,21 @@ class MCTSNode(object):
 
     @property
     def N(self):
-        return self.parent.child_N[self.trans_id]
+        return self.parent.child_N[self.parent_local_trans_id]
 
     @N.setter
     def N(self, value):
-        self.parent.child_N[self.trans_id] = value
+        self.parent.child_N[self.parent_local_trans_id] = value
 
     @property
     def W(self):
-        return self.parent.child_W[self.trans_id]
+        return self.parent.child_W[self.parent_local_trans_id]
 
     @W.setter
     def W(self, value):
-        self.parent.child_W[self.trans_id] = value
+        self.parent.child_W[self.parent_local_trans_id] = value
 
-    def select_leaf(self, mol_index, lbl1, lbl2):
+    def select_leaf(self, decoder = None):
         current = self
         while True:
             # if a node has never been evaluated, we have no basis to select a child.
@@ -232,21 +241,29 @@ class MCTSNode(object):
             # HACK: if last move was a pass, always investigate double-pass first
             # to avoid situations where we auto-lose by passing too early.
 
-            best_move = np.argmax(current.child_action_score)
-            best_transformation = lbl1.inverse_transform(lbl2.inverse_transform(best_move))
-            current = current.maybe_add_child(best_transformation,best_move, mol_index)
+            best_move_local = np.argmax(current.child_action_score)
+            best_move = self.local_global_trans_maps[best_move_local]
+            best_transformation = decoder(best_move)
+            mol_index = self.local_trans_mol_maps[best_move_local]
+            current = current.maybe_add_child(best_transformation, best_move_local,
+                                              mol_index = mol_index)
         return current
 
 
-    def maybe_add_child(self, transformation, trans_id,  mol_index = None):
+    def maybe_add_child(self, transformation, parent_local_trans_id, mol_index = None):
         """ Adds child node for transformation if it doesn't already exist, and returns it. """
         if transformation not in self.children:
             assert (mol_index is not None)
             new_state = self.state.transform(transformation, mol_index)
-            self.children[transformation] = MCTSNode(
-                new_state, transformation=transformation, trans_id=trans_id, parent=self)
-            #print(self.children)
+            self.children[transformation] = MCTSNode(new_state,
+                                                     parent_local_trans_id = parent_local_trans_id,
+                                                     local_global_trans_maps = None,
+                                                     local_trans_mol_maps = None,
+                                                     parent=self)
         return self.children[transformation]
+
+    def copy(self):
+        return copy.deepcopy(self)
 
 
     def add_virtual_loss(self, up_to):
@@ -272,8 +289,8 @@ class MCTSNode(object):
             return
         self.parent.revert_virtual_loss(up_to)
 
-    def incorporate_results(self, transformation_probabilities, build_block_mols):
-        assert transformation_probabilities.shape == (hp.num_transformations,)
+    def incorporate_results(self, transformation_probabilities,local_global_trans_maps,local_trans_mol_maps, build_block_mols):
+        assert transformation_probabilities.shape == (hp.expand_topk,)
         # A finished game should not be going through this code path - should
         # directly call backup_value() on the result of the game.
         assert not self.state.is_solved(build_block_mols=build_block_mols)
@@ -300,7 +317,9 @@ class MCTSNode(object):
         # continuing to explore the most favorable move. This is a waste of search.
         #
         # The value seeded here acts as a prior, and gets averaged into Q calculations.
-        self.child_W = np.ones([hp.num_transformations], dtype=np.float32)
+        self.child_W = np.ones([hp.expand_topk], dtype=np.float32)
+        self.local_global_trans_maps = local_global_trans_maps
+        self.local_trans_mol_maps = local_trans_mol_maps
 
     def backup_value(self, value, up_to):
         """Propagates a value estimation up to the root node.
@@ -323,7 +342,7 @@ class MCTSNode(object):
     def inject_noise(self):
         epsilon = 1e-5
         legal_transformations = (1 - self.illegal_transformations) + epsilon
-        a = legal_transformations * ([hp.dirichlet_noise_alpha] * hp.num_transformations)
+        a = legal_transformations * ([hp.dirichlet_noise_alpha] * hp.expand_topk)
         dirichlet = np.random.dirichlet(a)
         self.child_prior = (self.child_prior * (1 - hp.dirichlet_noise_weight) +
                             dirichlet * hp.dirichlet_noise_weight)
@@ -342,27 +361,32 @@ class MCTSNode(object):
             return probs
         return probs / np.sum(probs)
 
-    def most_visited_path_nodes(self):
+    def most_visited_path_nodes(self, decoder):
         node = self
         output = []
         while node.children:
             next_kid = np.argmax(node.child_N)
-            node = node.children.get(next_kid)
+            next_kid_ = self.local_global_trans_maps[next_kid]
+            next_kid_ = decoder([next_kid_])[0]
+            node = node.children.get(next_kid_)
+            print("node", node)
+            print("next_kid_", next_kid_)
+            #print("node.children", node.children)
             assert node is not None
             output.append(node)
         return output
 
-    def most_visited_path(self):
+    def most_visited_path(self, decoder):
         output = []
         node = self
-        for node in self.most_visited_path_nodes():
-            output.append("%s (%d) ==> " % (node.transformation, node.N))
+        for node in self.most_visited_path_nodes(decoder):
+            output.append("%s (%d) ==> " % (node.parent.local_global_trans_maps[node.parent_local_trans_id], node.N))
 
         output.append("Q: {:.5f}\n".format(node.Q))
         return ''.join(output)
 
-    def describe(self):
-        sort_order = list(range(hp.num_transformations))
+    def describe(self, decoder):
+        sort_order = list(range(hp.expand_topk))
         sort_order.sort(key=lambda i: (
             self.child_N[i], self.child_action_score[i]), reverse=True)
         soft_n = self.child_N / max(1, sum(self.child_N))
@@ -373,7 +397,7 @@ class MCTSNode(object):
         # Dump out some statistics
         output = []
         output.append("{q:.4f}\n".format(q=self.Q))
-        output.append(self.most_visited_path())
+        output.append(self.most_visited_path(decoder))
         output.append(
             "move : action    Q     U     P   P-Dir    N  soft-N  p-delta  p-rel")
         for key in sort_order[:15]:

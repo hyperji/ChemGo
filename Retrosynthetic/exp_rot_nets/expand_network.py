@@ -149,6 +149,25 @@ class Expand_Network(object):
         mol_fps = mol_fps[:,feat_indexes]
         return self.predict(mol_fps)
 
+    def run_many(self, states, all_unsolved_indexes, feat_indexes):
+        all_results = []
+        length = len(states)
+        length_per_state = [len(states[p].mols) for p in range(length)]
+        cumsum = np.cumsum(length_per_state)
+        all_unsolved_mols_smiles = []
+        for i in range(length):
+            unsolved_mols_smiles = [states[i].mols[j] for j in all_unsolved_indexes[i]]
+            all_unsolved_mols_smiles += unsolved_mols_smiles
+        unsolved_mols = [Chem.MolFromSmiles(i) for i in all_unsolved_mols_smiles]
+        mol_fps = get_product_fingerprint(unsolved_mols, fp_dim=1000000)
+        mol_fps = mol_fps[:, feat_indexes]
+        preds = self.predict(mol_fps)
+        all_results.append(preds[:cumsum[0]])
+        for ii in range(1, len(cumsum)):
+            partial_result = preds[cumsum[ii - 1]:cumsum[ii]]
+            all_results.append(partial_result)
+        return all_results
+
 
     def save(self, save_path):
         self.model.save(save_path)

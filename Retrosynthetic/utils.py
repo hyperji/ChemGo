@@ -76,3 +76,18 @@ def get_top_k_index(target_array, k):
 def dbg(*objects, file=sys.stderr, flush=True, **kwargs):
     "Helper function to print to stderr and flush"
     print(*objects, file=file, flush=flush, **kwargs)
+
+
+
+def get_topk_transformation_v2(topk, all_move_probs):
+    shape = all_move_probs.shape
+    flattened_probs = all_move_probs.flatten()
+    topk_indexes = flattened_probs.argsort()[-topk:][::-1]
+    topk_probs = flattened_probs[topk_indexes]
+    action_mols_map = np.zeros_like(topk_indexes)
+    for i in range(shape[0]):
+        base = i * shape[1]
+        mask = np.logical_and(base <= topk_indexes, topk_indexes < base + shape[1])
+        action_mols_map[mask] = i
+        topk_indexes[mask] = topk_indexes[mask] - base
+    return action_mols_map, topk_probs, topk_indexes
